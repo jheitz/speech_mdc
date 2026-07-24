@@ -1,0 +1,24 @@
+config_data:
+  dataset: LUHA2026
+  task: all_individual
+  transcript_version: google
+config_audio_features:
+  feature_version: reduced
+config_linguistic_features:
+  feature_version: reduced
+config_demographic_features:
+  selected_features: ["age", "gender_unified", "education_binary", "country", "socioeconomic"]
+config_model:
+  model_name: SVR
+  cv_splits: 10
+  target_variable: [composite_language, composite_memory, composite_executive_function, composite_speed]
+debug: false
+model: Regression
+data_transformers:
+- Task Features
+- Linguistic Features
+- Audio Features
+- Demographic Features
+data_preprocessors:
+- Outlier Removal and Imputation
+- Feature Standardizer

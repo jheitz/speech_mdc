@@ -1,0 +1,30 @@
+config_data:
+  dataset: LUHACombined
+  task: all_individual
+  transcript_version: google
+  split: wave1_cohortA
+config_audio_features:
+  feature_version: reduced
+config_linguistic_features:
+  feature_version: reduced
+config_demographic_features:
+  selected_features: ["age", "gender_unified", "education_binary", "country", "socioeconomic"]
+config_model:
+  model_name: SVR
+  cv_splits: 10
+  target_variable: [composite_language, composite_memory, composite_speed, composite_executive_function]
+  svr_parameters:
+    gamma: 0.001
+    epsilon: 0.321471781635738
+    C: 3.359818286283781
+  #calculate_shap: True  # calculate SHAP values, tasks long for SVR
+debug: false
+model: Regression
+data_transformers:
+- Linguistic Features
+- Audio Features
+- Demographic Features
+- Task Features
+data_preprocessors:
+- Outlier Removal and Imputation
+- Feature Standardizer

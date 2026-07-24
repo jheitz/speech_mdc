@@ -1,0 +1,5 @@
+# Don't include csunghye_all_measures_raw in git due to copyright reasons
+csunghye_all_measures_raw.csv
+
+# don't include model_fitted_2026-02-13-1011.rds due to potential data included
+model_fitted_2026-02-13-1011.rds

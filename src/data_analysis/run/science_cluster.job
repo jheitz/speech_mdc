@@ -1,0 +1,40 @@
+#!/usr/bin/bash -l
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=10GB
+#SBATCH --time=10:59:00
+#SBATCH --output=/home/jheitz/data/results/%j.out
+
+# memory and runtine requirements (all_individual, 2026_kw15 data):
+# wavlm: 65GB / 23:59:00 hours  --  deberta: 10GB / 5:00:00 hours
+
+# run this job using one of the following commands:
+#   sbatch --gpus=T4:1 cluster.job    # quickest to be scheduled
+#   sbatch --gpus=H100:1 science_cluster.job  # best
+#   sbatch --gpus=A100:1 science_cluster.job  # second best   <<- good choice, will actually be scheduled
+#   sbatch --gpus=V100:1 --constr,aint=GPUMEM32GB science_cluster.job  # third best  (too small for batch size 16)
+#   sbatch --gpus=1 --constraint=GPUMEM80GB science_cluster.job  # this chooses A100 or H100, whatever is available first
+
+
+
+datetime_str=$(date '+%Y%m%d_%H%M')_$(openssl rand -hex 2)
+
+echo ">>> Activating conda environment ..."
+module load miniforge3  # instead of mamba
+source activate phd2
+
+cd ..
+
+# this avoids pandas error: ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `GLIBCXX_3.4.29' not found
+export LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6"
+
+echo ">>> Running python script ..."
+
+
+# For THESIS (all_individual tasks)
+python -u run.py --config configs/transformer_based/wavlm/wave1_cohortA/kw36b_v2_all_individual_with_unused_features.yaml --name wavlm_kw36b_language_all_individual_with_unused_features_wave1_cohortA
+python -u run.py --config configs/transformer_based/wavlm/test_on_cohortB/kw36b_v2_all_individual_with_unused_features.yaml --name wavlm_kw36b_language_all_individual_with_unused_features_test_on_cohortB
+
+python -u run.py --config configs/transformer_based/deberta/wave1_cohortA/kw38_v1_all_individual_unused_features.yaml --name deberta_kw38_v1_all_individual_unused_features_wave1_cohortA
+python -u run.py --config configs/transformer_based/deberta/test_on_cohortB/kw38_v1_all_individual_unused_features.yaml --name deberta_kw38_v1_all_individual_unused_features_test_on_cohortB
+
+

@@ -1,0 +1,34 @@
+config_data:
+  dataset: LUHACombined
+  task: all_individual
+  transcript_version: google
+  split: wave1_cohortA
+config_model:
+  batch_size: 2
+  cv_splits: 5
+  learning_rate: 1.5151321866558307e-07
+  learning_rate_lora: 8.155434047594913e-06
+  lora_dropout: 0.2
+  lora_modules: attention_full
+  lora_r: 32
+  num_train_epochs: 30
+  target_variable: composite_language
+  use_lora: true
+  use_external_features: false
+debug: false
+model: DeBERTa
+
+# also calculate features
+data_transformers:
+- Linguistic Features
+- Demographic Features
+- Task Features
+data_preprocessors:
+- Outlier Removal and Imputation
+- Feature Standardizer
+config_audio_features:
+  feature_version: reduced
+config_linguistic_features:
+  feature_version: reduced
+config_demographic_features:
+  selected_features: ["age", "gender_unified", "education_binary", "country", "socioeconomic"]

@@ -1,0 +1,62 @@
+name: phd_new
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  # Core Python
+  - python=3.12
+
+  # Data Processing
+  - pandas
+  - numpy
+  - scipy
+  - statsmodels
+
+  # Machine Learning & Deep Learning
+  - scikit-learn
+  - scikit-optimize
+  - pytorch::pytorch=2.5.1
+  - pytorch::torchaudio
+  - pytorch::torchvision
+  - torchmetrics
+  - ffmpeg=6.1.1
+  - ffmpeg-python
+  - pip
+  - pip:
+    # Hugging Face ecosystem
+    - transformers==4.44.2
+    - datasets==2.19.1
+    - peft==0.11.1
+    - accelerate==0.33.0
+    - sentencepiece
+
+    # Model Interpretability
+    - shap
+    - lime
+
+    # Audio Processing
+    - librosa
+    - soundfile
+    - webrtcvad
+    - pydub
+    - audioread
+    - opensmile==2.5.0
+
+    # Natural Language Processing
+    - nltk
+    - stanza==1.5
+
+    # Visualization
+    - matplotlib
+    - seaborn
+    - plotly
+
+    # Cloud Services
+    - openai==1.12
+    - google-cloud-storage==2.14
+    - google-cloud-speech==2.24
+
+    # YAML support
+    - pyyaml
