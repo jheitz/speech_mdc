@@ -14,7 +14,7 @@ from data_analysis.model.regression import Regression
 from data_analysis.model.DeBERTav3 import DeBERTa
 from data_analysis.model.wavlm import WavLMModel
 from util.helpers import create_directory, store_timing_information
-from data_analysis.dataloader.dataloader import DataLoader
+from data_analysis.dataloader.dataloader import DataLoader, PittDataLoader
 from data_analysis.data_transformation.linguistic_features import LinguisticFeatures
 from data_analysis.data_transformation.audio_features import AudioFeatures
 from data_analysis.data_transformation.demographic_features import DemographicFeatures
@@ -58,6 +58,8 @@ def run(run_parameters: RunParameters, config: Config, CONSTANTS: Constants):
         dataloader = DataLoader(debug=debug, dataset_type=DatasetType.LUHA2026, config=config, run_parameters=run_parameters)
     elif dataset == 'LUHACombined':
         dataloader = DataLoader(debug=debug, dataset_type=DatasetType.LUHACombined, config=config, run_parameters=run_parameters)
+    elif dataset == 'PITT':
+        dataloader = PittDataLoader(debug=debug, config=config, run_parameters=run_parameters)
     else:
         raise ValueError(f"Invalid dataset {dataset}")
 

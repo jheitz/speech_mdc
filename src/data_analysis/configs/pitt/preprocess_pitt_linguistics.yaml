@@ -1,0 +1,9 @@
+config_data:
+  dataset: PITT
+  store_dataset_after_transformations: True
+config_linguistic_features:
+  feature_version: reduced
+debug: false
+data_transformers:
+- Linguistic Features
+- Task Features

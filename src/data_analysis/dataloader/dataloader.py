@@ -1,5 +1,7 @@
 import os
+import re
 
+import librosa
 import numpy as np
 import pandas as pd
 from pydub import AudioSegment
@@ -12,8 +14,9 @@ from data_analysis.util.decorators import cache_to_file_decorator
 from util.helpers import hash_list, prepare_demographics
 from sklearn.model_selection import train_test_split
 
-from data_analysis.dataloader.ADReSS_logic.dataloader import ADReSSWithPITTDataLoader as OriginalADReSSWithPITTDataLoader
 from data_analysis.dataloader.ADReSS_logic.audio_cutter import AudioCutter
+from data_analysis.dataloader.chat_parser import ChatTranscriptParser
+from data_analysis.data_transformation.helpers.voice_activity_detector import VoiceActivityDetector
 from util.google_speech_transcription import GoogleSpeechTranscriber
 
 class LuhaBaseDataLoader:
@@ -32,24 +35,26 @@ class LuhaBaseDataLoader:
         self.run_parameters = run_parameters
 
         self.dataset_type = dataset_type
-        assert self.dataset_type in [DatasetType.LUHA2024, DatasetType.LUHA2026, DatasetType.ADReSS, DatasetType.LUHACombined], f"Invalid dataset type {dataset_type}"
+        assert self.dataset_type in [DatasetType.LUHA2024, DatasetType.LUHA2026, DatasetType.ADReSS, DatasetType.LUHACombined, DatasetType.PITT], f"Invalid dataset type {dataset_type}"
 
         try:
             self.transcript_version = self.config.config_data.transcript_version
         except (AttributeError, KeyError):
             self.transcript_version = 'google'
-        valid_transcript_versions = ['google', 'whisper']
+        valid_transcript_versions = ['google', 'whisper', 'manual']
         assert self.transcript_version in valid_transcript_versions, f"Invalid transcript version {self.transcript_version}. Should be in {valid_transcript_versions}"
 
         try:
             self.task = self.config.config_data.task
         except (AttributeError, KeyError):
-            self.task = 'pictureDescription'
+            self.task = 'cookie' if self.dataset_type == DatasetType.PITT else 'pictureDescription'
             print(f"No task specified, loading {self.task}")
         if self.dataset_type == DatasetType.LUHA2024:
             valid_tasks = ['cookieTheft', 'journaling', 'phonemicFluency', 'picnicScene', 'semanticFluency', 'pictureDescription', 'pictureNaming', 'all_individual']
         elif self.dataset_type == DatasetType.LUHA2026:
             valid_tasks = ['cookieTheft', 'journaling', 'pictureDescription', 'pictureNaming', 'cookieTheftImmediateRecall', 'cookieTheftDelayedRecall', 'picnicScene', 'all_individual']
+        elif self.dataset_type == DatasetType.PITT:
+            valid_tasks = ['cookie', 'fluency', 'all_individual']
         elif self.dataset_type == DatasetType.LUHACombined:
             valid_tasks = ['cookieTheft', 'journaling', 'picnicScene', 'pictureDescription', 'pictureNaming', 'all_individual']
         else:
@@ -266,13 +271,22 @@ class LuhaBaseDataLoader:
         common_cols = [c for c in dfs[0].columns if c in set(set.intersection(*map(set, [df.columns for df in dfs])))]
         return [df[common_cols] for df in dfs]
 
-    def _multiply_dataset_with_individual_spontaneous_speech_tasks(self, dataset, transcripts, audio_files_df):
+    def _multiply_dataset_with_individual_spontaneous_speech_tasks(self, dataset, transcripts, audio_files_df,
+                                                                   tasks=None, extra_task_variables=None):
+        """
+        extra_task_variables: further data variables that differ per task, as
+        {variable name: dataframe with one column per task}
+        """
+        if tasks is None:
+            tasks = ['cookieTheft', 'journaling', 'picnicScene']
         print("Combining all spontaneous speech tasks as individual samples")
         datasets = []
-        for task in ['cookieTheft', 'journaling', 'picnicScene']:
+        for task in tasks:
             dataset_here = dataset.copy()
             dataset_here.transcripts = transcripts[task].to_numpy()
             dataset_here.audio_files = audio_files_df[task].to_numpy()
+            for variable, values_per_task in (extra_task_variables or {}).items():
+                setattr(dataset_here, variable, values_per_task[task].to_numpy())
             dataset_here.tasks = np.array([task] * len(dataset))
             datasets.append(dataset_here)
 
@@ -514,7 +528,7 @@ class Luha2026DataLoader(LuhaBaseDataLoader):
         try:
             compatible_with_2024 = self.config.config_data.compatible_with_2024
         except:
-            compatible_with_2024 = False
+            compatible_with_2024 = True
         factor_scores_theory_csv = self.CONSTANTS.FACTOR_SCORES_THEORY_2026_COMPATIBLE_WITH_2024 if compatible_with_2024 else self.CONSTANTS.FACTOR_SCORES_THEORY_2026_INDEPENDENT
         print(f"Using compatible_with_2024={compatible_with_2024}, i.e. factor scores at {factor_scores_theory_csv}")
         factor_scores_theory = pd.read_csv(factor_scores_theory_csv)
@@ -797,11 +811,688 @@ class DataLoader:
             return Luha2026DataLoader(*args, **kwargs)
         elif dataset_type == DatasetType.LUHACombined:
             return LuhaCombinedDataLoader(*args, **kwargs)
+        elif dataset_type == DatasetType.PITT:
+            return PittDataLoader(*args, **kwargs)
         else:
             raise ValueError(f"Unknown dataset type {dataset_type}")
 
 
 
+
+
+
+
+class PittDataLoader(LuhaBaseDataLoader):
+    """
+    The full PITT corpus (DementiaBank), i.e. all recordings, independent of the ADReSS challenge.
+
+    In contrast to ADReSSDataLoader (which uses OriginalADReSSWithPITTDataLoader and therefore only
+    loads the subset of PITT recordings that is part of the ADReSS challenge), this loads every
+    PITT recording of the cookie theft description ('cookie') and the verbal fluency task
+    ('fluency'), for both the Dementia and the Control group. The other two tasks of the corpus
+    ('recall' and 'sentence') only come with transcripts, no audio, and are therefore not loaded.
+
+    One sample = one recorded session, named "{participant}-{visit}" (e.g. "002-1"), which is
+    exactly the file name used in the corpus. Participants are recorded up to 5 times, so they
+    appear in multiple samples. This is encoded the same way as in the LUHA datasets:
+    sample_names_longitudinal is the participant, waves is "visit0", "visit1", ...
+    Note that the group is a property of the session, not of the participant: participant 172 is
+    Control at visit 0 and Dementia afterwards.
+
+    The corpus audio is mp3, which is converted to wav (written to the cache directory).
+
+    Transcripts are the manual CHAT (.cha) transcripts that come with the corpus
+    (transcript_version 'manual', the default). With transcript_version 'google', the CHAT
+    transcripts are not used as text; Google ASR is run over the audio instead. In that case the
+    interviewer is cut out of the recording first (unless only_PAR is False), and audio_files points
+    at those cut recordings, so that audio and transcript describe the same signal. Both the cut
+    audio and the transcripts are cached.
+
+    Visit dates are not part of the CHAT headers and come from the metadata spreadsheet instead.
+    They are cross-checked against the age of the CHAT headers, see _check_visit_dates_against_age.
+    """
+
+    # tasks of the corpus for which audio is available
+    TASKS = ['cookie', 'fluency']
+
+    # sub-directories of the corpus, and the corresponding binary classification target
+    GROUPS = {'Control': 0, 'Dementia': 1}
+
+    # >= 16 years of education is roughly a bachelor's degree or more, which is how 'high-education'
+    # is defined for the LUHA data (see data_preparation/preparation_logic/data_preparator.py)
+    EDUCATION_YEARS_HIGH_EDUCATION_THRESHOLD = 16
+
+    # Date, MMSE and diagnosis of each study visit in the metadata spreadsheet, in visit order. Its
+    # readme sheet confirms the numbering: "001-0.cha corresponds to visit 1 data on the spreadsheet",
+    # so the first column of each list belongs to visit 0 of the file names. Note that the columns are
+    # named inconsistently in the sheet itself (idate/mms count from 1, basedx/dx1 from 0).
+    VISIT_DATE_COLUMNS = ['idate', 'visit2da', 'visit3', 'visit4', 'visit5', 'visit6', 'visit7']
+    VISIT_MMSE_COLUMNS = ['mms', 'mmse2', 'mmse3', 'mmse4', 'mmse5', 'mmse6', 'mmse7']
+    VISIT_DIAGNOSIS_COLUMNS = ['basedx', 'dx1', 'dx2', 'dx3']
+
+    # The diagnosis codes of the spreadsheet map onto the labels of the CHAT tier by their leading
+    # digit (see its readme sheet). 4 (other dementia), 5 (complains of problems, nothing diagnosed),
+    # 7 (memory only / psych / cerebrovascular) and 9 do not map onto one label, and the CHAT tier
+    # carries the main diagnosis only, so recordings with those codes are not comparable. Negative
+    # codes are used as a missing marker.
+    DIAGNOSIS_CODE_FAMILIES = {1: 'ProbableAD', 2: 'PossibleAD', 3: 'Vascular', 6: 'MCI', 8: 'Control'}
+
+    # where the recordings with the interviewer cut out are kept, below DATA_INTERMEDIATES
+    PARTICIPANT_ONLY_AUDIO_DIR = os.path.join("pitt", "participant_only_audio")
+
+    # A visit date counts as inconsistent with the age of the CHAT header if the time elapsed between
+    # two visits disagrees by at least this much. The ages are whole years, so a disagreement below
+    # one year follows from the rounding alone and says nothing about the dates.
+    VISIT_DATE_AGE_TOLERANCE_YEARS = 1.0
+
+    def __init__(self, *args, **kwargs):
+        kwargs['name'] = 'PITT Dataloader'
+        kwargs['dataset_type'] = DatasetType.PITT
+        super().__init__(*args, **kwargs)
+
+        # 'manual' uses the CHAT transcripts that come with the corpus, 'google' ignores them and runs
+        # Google ASR over the audio instead (whisper is not implemented for this corpus)
+        try:
+            self.transcript_version = self.config.config_data.transcript_version
+        except (AttributeError, KeyError):
+            self.transcript_version = 'manual'
+        valid_transcript_versions = ['manual', 'google']
+        assert self.transcript_version in valid_transcript_versions, \
+            f"Invalid transcript version {self.transcript_version} for the PITT corpus. Should be in {valid_transcript_versions}"
+
+        assert self.waves is None, \
+            f"The waves config refers to the LUHA data collection waves and cannot be used for PITT (waves={self.waves}). " \
+            f"The PITT 'waves' are the visits of a participant."
+
+        # only keep participant (PAR) parts if only_PAR == True, otherwise also include interviewer (INV)
+        try:
+            self.only_PAR = self.config.config_data.only_PAR
+        except (AttributeError, KeyError):
+            self.only_PAR = True
+
+        self.chat_parser = ChatTranscriptParser(config={'only_PAR': self.only_PAR, 'keep_pauses': False,
+                                                        'keep_terminators': False,
+                                                        'keep_unintelligable_speech': False},
+                                                constants=self.CONSTANTS)
+
+        # only needed for transcript_version 'google', and needs GCP credentials, so create it lazily
+        self._google_transcriber = None
+        self.audio_cutter = AudioCutter(config=self.config, constants=self.CONSTANTS,
+                                        run_parameters=self.run_parameters)
+        self.voice_activity_detector = VoiceActivityDetector(debug=False)
+
+        self.tasks_to_load = self.TASKS if self.task == 'all_individual' else [self.task]
+
+        print(f"Initializing dataloader {self.name} (transcript_version {self.transcript_version}, "
+              f"task {self.task}, only_PAR {self.only_PAR})")
+        if self.transcript_version == 'google':
+            print(f"... transcribing with Google ASR"
+                  + (", after removing the interviewer from the audio" if self.only_PAR else ""))
+
+    @property
+    def google_transcriber(self):
+        if self._google_transcriber is None:
+            self._google_transcriber = GoogleSpeechTranscriber()
+        return self._google_transcriber
+
+    @cache_to_file_decorator(n_days=2 * 365, verbose=False)
+    def _convert_mp3_to_wav(self, mp3_path):
+        """
+        Convert one of the PITT mp3 files to wav and return the path of the new file.
+        The wav files are written to the cache directory, mirroring the directory structure of the corpus.
+        """
+        relative_path = os.path.relpath(mp3_path, self.CONSTANTS.DATA_PITT_ROOT)
+        wav_path = os.path.join(self.CONSTANTS.CACHE_DIR_CENTRALIZED, "pitt_wav",
+                                re.sub(r"\.mp3$", ".wav", relative_path))
+        os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+
+        if not os.path.exists(wav_path):
+            with open(wav_path, "wb") as f:
+                AudioSegment.from_file(mp3_path, format="mp3").export(f, format="wav")
+
+        return wav_path
+
+    def _remove_interviewer_from_audio(self, wav_path, transcript_path):
+        """
+        Cut the interviewer out of a recording and return the path of the new file.
+
+        The CHAT transcripts carry the timing of every utterance, which gives the speaker
+        segmentation. That segmentation is then applied with the same logic that is used for the
+        ADReSS data (AudioCutter, see also the dementia project's 2023_08_30_segmentation_file_ADReSS
+        script, which writes the same segmentation to csv first): everything that is not explicitly
+        the interviewer is kept, so pauses and untimed stretches stay with the participant.
+
+        These files are kept in the intermediates directory rather than in the cache, so that they
+        stay around as data. An already cut file is reused as it is, which is why this does not use
+        cache_to_file_decorator: the file on disk is the cache.
+        """
+        relative_path = os.path.relpath(wav_path, os.path.join(self.CONSTANTS.CACHE_DIR_CENTRALIZED, "pitt_wav"))
+        new_path = os.path.join(self.CONSTANTS.DATA_INTERMEDIATES, self.PARTICIPANT_ONLY_AUDIO_DIR, relative_path)
+        if os.path.exists(new_path):
+            return new_path
+
+        with open(transcript_path, encoding='utf8') as file:
+            segmentation = self.chat_parser.extract_speaker_segmentation(file.read())
+
+        # utterances without timing information cannot be located in the audio
+        segmentation = segmentation.dropna(subset=['begin', 'end'])
+        assert (segmentation['speaker'] == 'PAR').any(), \
+            f"No timed participant utterance in {transcript_path}, cannot remove the interviewer"
+
+        return self.audio_cutter.cut_to_participant_segments(wav_path, segmentation, new_path)
+
+    @cache_to_file_decorator(n_days=2 * 365, verbose=False)
+    def _estimate_snr(self, wav_path):
+        """
+        Signal to noise ratio of a recording, in dB.
+
+        Voice activity detection (VoiceActivityDetector, webrtcvad) splits the audio into speech and
+        non-speech segments. The speech segments are taken as the signal and the non-speech ones as
+        the noise, and the ratio of their mean power is reported in dB. Note that the speech segments
+        contain the noise as well, so this is the ratio of (signal + noise) to noise and therefore an
+        optimistic estimate, especially at low SNR.
+
+        Returns nan if the recording has no speech or no non-speech segment to measure, or if either
+        is completely silent.
+        """
+        segments = self.voice_activity_detector.get_segments(wav_path)
+        # the segment boundaries are in seconds on the 16 kHz mono signal the detector works on
+        audio, sample_rate = librosa.load(wav_path, sr=16000, mono=True)
+
+        def mean_power(segment_type):
+            parts = [audio[int(segment.start * sample_rate):int(segment.end * sample_rate)]
+                     for segment in segments[segments['type'] == segment_type].itertuples()]
+            parts = [part for part in parts if len(part) > 0]
+            if len(parts) == 0:
+                return np.nan
+            return float(np.mean(np.concatenate(parts) ** 2))
+
+        signal_power, noise_power = mean_power('voice'), mean_power('pause')
+        if not signal_power > 0 or not noise_power > 0:
+            return np.nan
+
+        return float(10 * np.log10(signal_power / noise_power))
+
+    @cache_to_file_decorator(n_days=2 * 365, verbose=False)
+    def _transcribe_with_google(self, wav_path):
+        """ Run the Google ASR model over a recording and return the transcript """
+        transcript = self.google_transcriber.transcribe_file(wav_path)['combined_transcript']
+        return transcript.strip().lower()
+
+    @staticmethod
+    def _parse_chat_header(chat_transcript):
+        """
+        Parse the @ID line of the participant (PAR) of a CHAT transcript, which has the format
+        language|corpus|code|age|sex|group|SES|role|education|custom|
+        In the PITT corpus, the 'education' slot holds the MMSE score (education in years is only
+        available in the metadata spreadsheet). Any of the fields can be empty.
+        """
+        match = re.search(r"^@ID:\s*(\S*\|\S*\|PAR\|.*)$", chat_transcript, re.MULTILINE)
+        assert match is not None, "No @ID line for the participant (PAR) found in the CHAT transcript"
+        fields = match.group(1).split("|")
+
+        def to_number(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return np.nan
+
+        # age is given as "57;" (years) or "64;00." (years;months.days)
+        age = to_number(re.sub(r";.*$", "", fields[3].strip()))
+        sex = {'male': 'm', 'female': 'f'}.get(fields[4].strip(), None)
+
+        return {'age': age, 'gender_unified': sex, 'diagnosis': fields[5].strip() or None,
+                'mmse': to_number(fields[8].strip())}
+
+    def _read_metadata_spreadsheet(self):
+        """
+        The metadata spreadsheet of the corpus. Its first rows are a title and an empty row, so the
+        column names are in the third row. Returns None if the spreadsheet is not available; the
+        result is kept, as several parts of the loader read from it.
+        """
+        if not hasattr(self, '_metadata_spreadsheet'):
+            if os.path.exists(self.CONSTANTS.DATA_PITT_METADATA):
+                self._metadata_spreadsheet = pd.read_excel(self.CONSTANTS.DATA_PITT_METADATA,
+                                                           sheet_name='data', header=2)
+            else:
+                print(f"Attention: PITT metadata {self.CONSTANTS.DATA_PITT_METADATA} not available, "
+                      f"education and visit dates will be missing")
+                self._metadata_spreadsheet = None
+        return self._metadata_spreadsheet
+
+    def _load_participant_metadata(self):
+        """
+        Participant-level metadata from the spreadsheet of the corpus: years of education (which is
+        not part of the CHAT headers, where the education slot holds the MMSE) and sex (as a fallback,
+        the CHAT header of a few recordings does not have it).
+        Returns None if the spreadsheet is not available.
+        """
+        metadata = self._read_metadata_spreadsheet()
+        if metadata is None:
+            return None
+
+        metadata = metadata[['id', 'educ', 'sex', 'entryage']].rename(
+            columns={'id': 'participant_id', 'educ': 'education_years', 'entryage': 'age_at_entry'})
+        metadata['participant_id'] = pd.to_numeric(metadata['participant_id'], errors='coerce')
+        metadata = metadata[metadata['participant_id'].notna()]
+        metadata['participant_id'] = metadata['participant_id'].astype(int)
+        assert not metadata['participant_id'].duplicated().any(), "Duplicate participant in the PITT metadata"
+
+        # sex is coded 1 = male, 0 = female in the spreadsheet
+        metadata['gender_unified'] = metadata['sex'].map({1: 'm', 0: 'f'})
+
+        return metadata.drop(columns=['sex'])
+
+    def _load_visit_metadata(self):
+        """
+        Date, MMSE and diagnosis of every study visit, from the metadata spreadsheet, in long format
+        (one row per participant and visit, using the same 0-based visit numbering as the corpus file
+        names). The MMSE and the diagnosis are also recorded in the CHAT headers and are used to
+        cross-check them, see _check_chat_headers_against_metadata.
+        Returns None if the spreadsheet is not available.
+        """
+        metadata = self._read_metadata_spreadsheet()
+        if metadata is None:
+            return None
+
+        participant_id = pd.to_numeric(metadata['id'], errors='coerce')
+
+        def to_long(columns, name, parse):
+            """ One column per visit in the spreadsheet becomes one row per visit """
+            return pd.concat([pd.DataFrame({'participant_id': participant_id, 'visit': visit,
+                                            name: parse(metadata[column])})
+                              for visit, column in enumerate(columns)])
+
+        to_number = lambda column: pd.to_numeric(column, errors='coerce')
+        visits = to_long(self.VISIT_DATE_COLUMNS, 'visit_date',
+                         lambda column: pd.to_datetime(column, errors='coerce'))
+        for columns, name in [(self.VISIT_MMSE_COLUMNS, 'mmse_spreadsheet'),
+                              (self.VISIT_DIAGNOSIS_COLUMNS, 'diagnosis_code_spreadsheet')]:
+            visits = visits.merge(to_long(columns, name, to_number), on=['participant_id', 'visit'],
+                                  how='outer')
+
+        visits = visits[visits['participant_id'].notna()]
+        # the three sources cover different numbers of visits, keep a row if any of them has something
+        visits = visits.dropna(how='all',
+                               subset=['visit_date', 'mmse_spreadsheet', 'diagnosis_code_spreadsheet'])
+        visits['participant_id'] = visits['participant_id'].astype(int)
+        assert not visits.duplicated(subset=['participant_id', 'visit']).any()
+
+        return visits.sort_values(by=['participant_id', 'visit']).reset_index(drop=True)
+
+    def _check_chat_headers_against_metadata(self, per_session):
+        """
+        Cross-check the CHAT headers against the metadata spreadsheet. The two describe the same
+        visits, so where they overlap they have to agree; where they do not, one of them is wrong and
+        the recording is worth a look before it is used.
+
+        Checked here: the sex and the age at the first visit of every participant, and the MMSE and
+        the diagnosis of every visit. The MMSE check doubles as a guard on the visit numbering, which
+        differs between the two sources and could silently slip by one.
+
+        Returns a boolean Series, indexed like per_session, marking the visits that disagree.
+        """
+        participant_metadata = self._load_participant_metadata()
+        problems = {}
+
+        # --- MMSE, which is in the education slot of the CHAT header ---
+        comparable = per_session.dropna(subset=['mmse', 'mmse_spreadsheet'])
+        disagreeing = comparable[comparable['mmse'] != comparable['mmse_spreadsheet']]
+        assert len(disagreeing) < 0.05 * len(comparable), \
+            f"The MMSE of the CHAT headers and of the spreadsheet disagree for {len(disagreeing)} of " \
+            f"{len(comparable)} visits, the visit numbering of the two sources is probably misaligned"
+        problems['MMSE'] = (len(comparable), [
+            f"{row.sample_name} ({row.mmse:.0f} vs {row.mmse_spreadsheet:.0f})"
+            for row in disagreeing.itertuples()])
+        mmse_inconsistent = per_session.index.isin(disagreeing.index)
+
+        # --- diagnosis, comparable only for the codes that map onto a single CHAT label ---
+        codes = per_session['diagnosis_code_spreadsheet']
+        family = codes.where(codes > 0).dropna().astype(int).astype(str).str[0].astype(int) \
+            .map(self.DIAGNOSIS_CODE_FAMILIES)
+        comparable = per_session.loc[family.dropna().index].assign(family=family)
+        comparable = comparable.dropna(subset=['diagnosis'])
+        disagreeing = comparable[comparable['family'] != comparable['diagnosis']]
+        problems['diagnosis'] = (len(comparable), [
+            f"{row.sample_name} (CHAT {row.diagnosis} vs code {row.diagnosis_code_spreadsheet:.0f} = {row.family})"
+            for row in disagreeing.itertuples()])
+        diagnosis_inconsistent = per_session.index.isin(disagreeing.index)
+
+        if participant_metadata is not None:
+            merged = per_session.merge(participant_metadata, on='participant_id', how='left',
+                                       suffixes=('', '_spreadsheet'))
+            merged.index = per_session.index
+
+            # --- sex ---
+            comparable = merged.dropna(subset=['gender_unified', 'gender_unified_spreadsheet'])
+            disagreeing = comparable[comparable['gender_unified'] != comparable['gender_unified_spreadsheet']]
+            problems['sex'] = (len(comparable), [
+                f"{row.sample_name} ({row.gender_unified} vs {row.gender_unified_spreadsheet})"
+                for row in disagreeing.itertuples()])
+            sex_inconsistent = per_session.index.isin(disagreeing.index)
+
+            # --- age at the first visit, which the spreadsheet records as entryage. Only visit 0 is
+            # comparable: the readme says later ages are approximated from the visit dates.
+            comparable = merged[(merged['visit'] == 0)].dropna(subset=['age', 'age_at_entry'])
+            disagreeing = comparable[comparable['age'] != comparable['age_at_entry']]
+            problems['age at first visit'] = (len(comparable), [
+                f"{row.sample_name} ({row.age:.0f} vs {row.age_at_entry:.0f})"
+                for row in disagreeing.itertuples()])
+            age_inconsistent = per_session.index.isin(disagreeing.index)
+        else:
+            sex_inconsistent = age_inconsistent = np.zeros(len(per_session), dtype=bool)
+
+        print("Cross-checking the CHAT headers against the metadata spreadsheet:")
+        for what, (n_comparable, disagreements) in problems.items():
+            print(f"   {what}: {n_comparable} visits comparable, {len(disagreements)} disagreeing"
+                  + (f" -> {', '.join(disagreements)}" if disagreements else ""))
+
+        inconsistent = mmse_inconsistent | diagnosis_inconsistent | sex_inconsistent | age_inconsistent
+        return pd.Series(inconsistent, index=per_session.index)
+
+    def _check_visit_dates_against_age(self, per_session):
+        """
+        The visit dates come from the metadata spreadsheet and the ages from the CHAT headers, and the
+        two have to agree: between two visits of a participant, the time elapsed according to the
+        dates has to match the difference in age. The two are not independent -- the readme sheet of
+        the spreadsheet says the age is exact at visit 0 only and is approximated from the visit dates
+        afterwards -- so a disagreement means the approximation or one of the dates is broken.
+        Since the ages are whole years, a disagreement of up to a year follows from the rounding
+        alone; beyond that, one of the two sources is wrong. A date that moves backwards while the
+        visit number increases is always wrong, however small the step.
+
+        Neither source can be trusted over the other, so this flags every visit of an affected
+        participant rather than trying to pick out the wrong one.
+        Returns a boolean Series indexed like per_session.
+        """
+        dated = per_session.dropna(subset=['visit_date', 'age']).sort_values(by=['participant_id', 'visit'])
+        elapsed_by_date = dated.groupby('participant_id')['visit_date'].diff().dt.days / 365.25
+        elapsed_by_age = dated.groupby('participant_id')['age'].diff()
+        deviation = (elapsed_by_date - elapsed_by_age).abs()
+        # not necessarily visit - 1: a visit in between can be unrecorded or undated
+        previous_visit = dated.groupby('participant_id')['visit'].shift()
+
+        problems = dated.assign(elapsed_by_date=elapsed_by_date, elapsed_by_age=elapsed_by_age,
+                                deviation=deviation, previous_visit=previous_visit)
+        problems = problems[(problems['deviation'] >= self.VISIT_DATE_AGE_TOLERANCE_YEARS)
+                            | (problems['elapsed_by_date'] < 0)]
+
+        affected = set(problems['participant_id'])
+        if len(affected) > 0:
+            print(f"\nATTENTION: the visit dates of {len(affected)} participants contradict the age in "
+                  f"the CHAT header, so one of the two sources is wrong for them:")
+            for _, problem in problems.iterrows():
+                print(f"   participant {problem.participant}, visit {problem.previous_visit:.0f} -> {problem.visit}: "
+                      f"{problem.elapsed_by_date:+.2f} years by date vs {problem.elapsed_by_age:+.0f} by age"
+                      + (" (date moves backwards)" if problem.elapsed_by_date < 0 else ""))
+            print(f"   -> all {sum(per_session['participant_id'].isin(affected))} visits of these "
+                  f"participants are marked in visit_date_age_inconsistent\n")
+
+        return per_session['participant_id'].isin(affected)
+
+    def _add_visit_dates(self, per_session):
+        """
+        Add the visit date of every session, plus the time axis derived from it:
+          visit_date                      date of the visit, NaT if the spreadsheet does not have it
+          years_since_baseline            years since the participant's baseline visit, see
+                                          _add_years_since_baseline
+          years_since_baseline_from_age   whether that value had to fall back to the age
+          visit_date_age_inconsistent     see _check_visit_dates_against_age
+        """
+        visit_metadata = self._load_visit_metadata()
+        if visit_metadata is None:
+            # no dates at all, but the age of the CHAT headers still gives a coarse time axis
+            per_session['visit_date'] = pd.NaT
+            per_session['visit_date_age_inconsistent'] = False
+            per_session['chat_metadata_inconsistent'] = False
+            return self._add_years_since_baseline(per_session)
+
+        merged = per_session.merge(visit_metadata, on=['participant_id', 'visit'], how='left')
+        assert merged['sample_name'].equals(per_session['sample_name']), "Merge changed the session order"
+
+        merged['chat_metadata_inconsistent'] = self._check_chat_headers_against_metadata(merged)
+        merged['visit_date_age_inconsistent'] = self._check_visit_dates_against_age(merged)
+        merged = self._add_years_since_baseline(merged)
+
+        n_dated = merged['visit_date'].notna().sum()
+        print(f"{n_dated} of {len(merged)} visits have a date in the metadata spreadsheet "
+              f"({merged.loc[merged['visit_date'].notna(), 'participant'].nunique()} participants)")
+
+        return merged.drop(columns=['mmse_spreadsheet', 'diagnosis_code_spreadsheet'])
+
+    def _add_years_since_baseline(self, per_session):
+        """
+        Add the time axis for longitudinal analyses: years between a visit and the participant's
+        baseline visit.
+
+        The baseline is the participant's earliest *dated* visit, which is not necessarily visit 0 --
+        earlier visits may not have been recorded, or may have no date in the spreadsheet. If none of
+        a participant's visits has a date, their earliest recorded visit becomes the baseline.
+
+        The spreadsheet has no date for a good number of visits, and those cannot be placed on a
+        date-based axis at all. Rather than leaving them out of longitudinal analyses, they fall back
+        to the age of the CHAT header, which exists for every visit but only in whole years, so the
+        value is much coarser. years_since_baseline_from_age marks where that happened, so the two
+        can be told apart (and the coarse ones dropped, if the analysis needs the precision).
+        """
+        ordered = per_session.sort_values(by=['participant_id', 'visit'])
+        baseline_index = ordered.groupby('participant_id')[['visit_date', 'visit']].apply(
+            lambda visits: visits['visit_date'].idxmin() if visits['visit_date'].notna().any()
+            else visits['visit'].idxmin())
+        baseline = per_session.loc[baseline_index.to_numpy()].set_index(baseline_index.index)
+
+        baseline_date = per_session['participant_id'].map(baseline['visit_date'])
+        baseline_age = per_session['participant_id'].map(baseline['age'])
+
+        years_by_date = (per_session['visit_date'] - baseline_date).dt.days / 365.25
+        years_by_age = per_session['age'] - baseline_age
+
+        per_session['years_since_baseline'] = years_by_date.fillna(years_by_age)
+        per_session['years_since_baseline_from_age'] = years_by_date.isna() & years_by_age.notna()
+
+        n_from_age = per_session['years_since_baseline_from_age'].sum()
+        n_missing = per_session['years_since_baseline'].isna().sum()
+        print(f"years_since_baseline: {(len(per_session) - n_from_age - n_missing)} visits from the "
+              f"visit dates, {n_from_age} from the age (no date available, whole years only), "
+              f"{n_missing} not available")
+
+        return per_session
+
+    def _load_sessions(self):
+        """
+        Collect every recording of the relevant tasks: one row per (session, task), with the
+        corresponding wav file, the preprocessed manual transcript and the session-level metadata.
+        """
+        sessions = []
+        for group in self.GROUPS:
+            for task in self.tasks_to_load:
+                audio_dir = os.path.join(self.CONSTANTS.DATA_PITT_ROOT, group, task)
+                transcript_dir = os.path.join(self.CONSTANTS.DATA_PITT_TRANSCRIPTS, group, task)
+                assert os.path.isdir(audio_dir), f"PITT audio directory {audio_dir} does not exist"
+
+                file_names = sorted(f for f in os.listdir(audio_dir) if f.endswith('.mp3'))
+                if self.debug:
+                    file_names = file_names[:self.debug if self.debug > 1 else 10]
+
+                print(f"Loading {len(file_names)} PITT {group} / {task} recordings...")
+                for file_name in file_names:
+                    sample_name = re.sub(r"\.mp3$", "", file_name)
+                    match = re.match(r"^(\d+)-(\d+)$", sample_name)
+                    assert match is not None, f"Unexpected PITT file name {file_name} in {audio_dir}"
+
+                    transcript_path = os.path.join(transcript_dir, f"{sample_name}.cha")
+                    assert os.path.exists(transcript_path), \
+                        f"No CHAT transcript {transcript_path} for audio file {file_name}"
+                    with open(transcript_path, encoding='utf8') as file:
+                        chat_transcript = file.read()
+
+                    wav_file = self._convert_mp3_to_wav(os.path.join(audio_dir, file_name))
+                    # the SNR describes the participant's own speech, so it is always estimated on
+                    # the recording with the interviewer removed, whatever the transcript version is
+                    participant_wav_file = self._remove_interviewer_from_audio(wav_file, transcript_path)
+
+                    audio_file = wav_file
+                    if self.transcript_version == 'google':
+                        # the interviewer has to go before transcribing, otherwise the ASR picks up
+                        # their speech as well. The cut file is what the transcript describes, so it
+                        # is also the audio file of the sample.
+                        if self.only_PAR:
+                            audio_file = participant_wav_file
+                        transcript = self._transcribe_with_google(audio_file)
+                    else:
+                        transcript = self.chat_parser.preprocess_transcript(chat_transcript, transcript_path)
+
+                    sessions.append({
+                        'sample_name': sample_name,
+                        'participant_id': int(match.group(1)),
+                        'participant': match.group(1),
+                        'visit': int(match.group(2)),
+                        'group': group,
+                        'task': task,
+                        'audio_file': audio_file,
+                        'transcript': transcript,
+                        'snr_db': self._estimate_snr(participant_wav_file),
+                        **self._parse_chat_header(chat_transcript),
+                    })
+
+        sessions = pd.DataFrame(sessions)
+        assert not sessions.duplicated(subset=['sample_name', 'task']).any(), \
+            f"Duplicate PITT recordings: {sessions[sessions.duplicated(subset=['sample_name', 'task'])].sample_name.to_list()}"
+        assert (sessions.groupby('sample_name')['group'].nunique() == 1).all(), \
+            "A session should belong to exactly one group (Control / Dementia)"
+
+        # order by participant and visit, so that a participant's sessions stay together
+        sessions = sessions.sort_values(by=['participant_id', 'visit']).reset_index(drop=True)
+        return sessions
+
+    def _pivot_by_task(self, sessions, value_column, sample_names):
+        """ From one row per (session, task) to one row per session, with one column per task """
+        pivoted = sessions.pivot(index='sample_name', columns='task', values=value_column)
+        pivoted = pivoted.reindex(index=sample_names, columns=self.tasks_to_load)
+        return pivoted.rename_axis(None, axis=1).reset_index()
+
+    def load_data(self):
+        print(f"Loading data using dataloader {self.name}")
+
+        sessions = self._load_sessions()
+
+        # one row per session (a participant has multiple sessions / visits)
+        per_session = sessions.drop_duplicates(subset=['sample_name'])[
+            ['sample_name', 'participant_id', 'participant', 'visit', 'group']].reset_index(drop=True)
+        sample_names = per_session['sample_name'].to_list()
+
+        # the session metadata is repeated in the CHAT header of every task, and is occasionally missing
+        # for one of them, so take the first non-missing value (ordered by self.TASKS)
+        metadata_columns = ['age', 'gender_unified', 'diagnosis', 'mmse']
+        task_order = {task: i for i, task in enumerate(self.TASKS)}
+        metadata = sessions.sort_values(by='task', key=lambda column: column.map(task_order)) \
+            .groupby('sample_name')[metadata_columns].first()
+        metadata = metadata.reindex(index=sample_names).reset_index()
+
+        audio_files_df = self._pivot_by_task(sessions, 'audio_file', sample_names)
+        transcripts = self._pivot_by_task(sessions, 'transcript', sample_names)
+        snr_df = self._pivot_by_task(sessions, 'snr_db', sample_names)
+
+        # the CHAT header values are needed to cross-check them against the metadata spreadsheet
+        per_session['age'] = metadata['age']
+        per_session['mmse'] = metadata['mmse']
+        per_session['diagnosis'] = metadata['diagnosis']
+        per_session['gender_unified'] = metadata['gender_unified']
+        per_session = self._add_visit_dates(per_session)
+
+        participant_metadata = self._load_participant_metadata()
+        if participant_metadata is not None:
+            participant_metadata = per_session[['participant_id']].merge(participant_metadata, on='participant_id',
+                                                                         how='left')
+            education_years = participant_metadata['education_years']
+            # the CHAT header of a few recordings has no sex, fall back to the participant-level metadata
+            gender_unified = metadata['gender_unified'].fillna(participant_metadata['gender_unified'])
+        else:
+            education_years = pd.Series(np.nan, index=per_session.index)
+            gender_unified = metadata['gender_unified']
+
+        demographics = pd.DataFrame({
+            'sample_name': sample_names,
+            'age': metadata['age'],
+            'gender_unified': gender_unified,
+            'education_years': education_years,
+            'education_binary': education_years.apply(
+                lambda years: np.nan if pd.isna(years)
+                else 'high-education' if years >= self.EDUCATION_YEARS_HIGH_EDUCATION_THRESHOLD
+                else 'low-education'),
+            'country': 'usa',
+            'diagnosis': metadata['diagnosis'],
+            'group': per_session['group'],
+        })
+
+        if self.task == 'all_individual':
+            transcripts_numpy = np.array([np.nan for _ in range(len(sample_names))])
+            audio_files_for_task = np.array([np.nan for _ in range(len(sample_names))])
+            snr_for_task = np.array([np.nan for _ in range(len(sample_names))])
+        else:
+            transcripts_numpy = transcripts[self.task].to_numpy()
+            audio_files_for_task = audio_files_df[self.task].to_numpy()
+            snr_for_task = snr_df[self.task].to_numpy()
+
+        dataset_name = f"PITT data ({self.task})"
+        dataset = Dataset(name=dataset_name, type=DatasetType.PITT, sample_names=np.array(sample_names),
+                          sample_names_longitudinal=per_session['participant'].to_numpy(),
+                          waves=per_session['visit'].apply(lambda visit: f"visit{visit}").to_numpy(),
+                          config={'data_transformers': [], 'debug': self.debug, 'only_PAR': self.only_PAR},
+                          audio_files=audio_files_for_task,
+                          transcripts=transcripts_numpy,
+                          snr_db=snr_for_task,
+                          demographics=demographics,
+                          mmse=metadata['mmse'].to_numpy(),
+                          visit_dates=per_session['visit_date'].to_numpy(),
+                          years_since_baseline=per_session['years_since_baseline'].to_numpy(),
+                          years_since_baseline_from_age=per_session['years_since_baseline_from_age'].to_numpy(),
+                          visit_date_age_inconsistent=per_session['visit_date_age_inconsistent'].to_numpy(),
+                          chat_metadata_inconsistent=per_session['chat_metadata_inconsistent'].to_numpy(),
+                          classification_target=per_session['group'].map(self.GROUPS).to_numpy(),
+                          tasks=np.array([self.task] * len(sample_names)),
+                          )
+
+        if self.task == 'all_individual':
+            dataset = self._multiply_dataset_with_individual_spontaneous_speech_tasks(
+                dataset, transcripts, audio_files_df, tasks=self.TASKS,
+                extra_task_variables={'snr_db': snr_df})
+
+        if self.min_n_letters is not None:
+            dataset = self._filter_samples_by_min_n_letters(dataset)
+
+        print(f"Loaded {len(dataset)} PITT samples of {per_session['participant'].nunique()} participants "
+              f"({per_session['group'].value_counts().to_dict()} sessions)")
+
+        if self.transcript_version == 'google' and self.only_PAR:
+            self._print_incomplete_interviewer_removal_warning()
+
+        if self.store_loaded_dataset:
+            dataset.store_to_disk(os.path.join(self.run_parameters.results_dir, "dataset_after_dataloader"))
+
+        return dataset
+
+    @staticmethod
+    def _print_incomplete_interviewer_removal_warning():
+        """
+        The interviewer removal is known to be incomplete, see the analysis in
+        analyses/kw35/pitt_chat_vs_google_transcripts.ipynb. This was a deliberate decision (the
+        alternative removes the pauses from every recording), so warn instead of changing it.
+        """
+        print("\n\n"
+              "ATTENTION: THE INTERVIEWER REMOVAL BEHIND THESE TRANSCRIPTS IS INCOMPLETE.\n"
+              "THE AUDIO IS CUT USING THE UTTERANCE TIMINGS OF THE CHAT FILES, FOLLOWING THE ADRESS\n"
+              "LOGIC IN AUDIOCUTTER: EVERYTHING NOT EXPLICITLY MARKED AS THE INTERVIEWER IS KEPT, SO\n"
+              "THAT PAUSES SURVIVE. THE CHAT FILES DO NOT ANNOTATE EVERYTHING THAT IS AUDIBLE, SO\n"
+              "WHATEVER SITS IN THE UNANNOTATED STRETCHES IS TRANSCRIBED AS WELL. IN A SAMPLE OF 60\n"
+              "RECORDINGS, 20% OF THE UNANNOTATED TIME WAS SPEECH, ABOUT 13% OF ALL SPEECH.\n"
+              "ROUGHLY 10 TO 18 OF THE 549 COOKIE RECORDINGS CARRY ENOUGH FOREIGN SPEECH TO MATTER,\n"
+              "MOSTLY EXAMINER INSTRUCTIONS AND ITEMS OF THE SENTENCE REPETITION TASK. THE WORST ARE\n"
+              "168-0, 129-1, 302-0, 225-2 AND 511-0; RANK BY INSERTIONS AGAINST THE MANUAL TRANSCRIPT\n"
+              "TO FIND THEM. THE MANUAL TRANSCRIPTS DO NOT HAVE THIS PROBLEM (THEY SELECT BY SPEAKER,\n"
+              "NOT BY TIME), BUT THEY MISS THE SAME UNANNOTATED SPEECH INSTEAD.\n"
+              "SEE ANALYSES/KW35/PITT_CHAT_VS_GOOGLE_TRANSCRIPTS.IPYNB\n"
+              "\n\n")
 
 
 

@@ -15,6 +15,7 @@ class DatasetType(Enum):
     LUHA2024 = 1
     LUHA2026 = 1.1
     LUHACombined = 1.2
+    PITT = 3
 
 class Dataset:
     def __init__(self, name, type: DatasetType, config, sample_names, **data):
@@ -105,7 +106,7 @@ class Dataset:
                     for var in self.data_variables.keys()
                     if isinstance(self.data_variables[var], pd.DataFrame)])
 
-        assert self.type in [DatasetType.LUHA2024, DatasetType.LUHA2026, DatasetType.LUHACombined], f"Invalid dataset type: {self.type}"
+        assert self.type in [DatasetType.LUHA2024, DatasetType.LUHA2026, DatasetType.LUHACombined, DatasetType.PITT], f"Invalid dataset type: {self.type}"
 
         waves_and_ids = pd.DataFrame({
             'sample_name': self.sample_names,

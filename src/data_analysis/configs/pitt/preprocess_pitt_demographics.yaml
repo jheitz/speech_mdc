@@ -1,0 +1,7 @@
+config_data:
+  dataset: PITT
+  store_dataset_after_transformations: True
+debug: false
+data_transformers:
+- Demographic Features
+- Task Features

@@ -116,6 +116,19 @@ class Constants:
         self.ACS_MAIN_OUTCOME_VARIABLES_EXTENDED = \
             self.ACS_MAIN_OUTCOME_VARIABLES + ['dragskill_time', 'clickskill_time', 'typeskill_time']
 
+        # DementiaBank (contains the ADReSS challenge data as well as the full PITT corpus)
+        self.DATA_DEMENTIABANK_ROOT = "/home/ubuntu/methlab/Students/Jonathan/data/dementiabank_extracted"
+        if self.local:
+            self.DATA_DEMENTIABANK_ROOT = "/Users/jheitz/phd/data/dementiabank_extracted"
+
+        # PITT corpus (DementiaBank), the full corpus, not only the subset used by the ADReSS challenge
+        # Audio:       DATA_PITT_ROOT/<Control|Dementia>/<cookie|fluency>/<participant>-<visit>.mp3
+        # Transcripts: DATA_PITT_TRANSCRIPTS/<Control|Dementia>/<cookie|fluency|recall|sentence>/<participant>-<visit>.cha
+        self.DATA_PITT_ROOT = os.path.join(self.DATA_DEMENTIABANK_ROOT, "Pitt")
+        self.DATA_PITT_TRANSCRIPTS = os.path.join(self.DATA_PITT_ROOT, "Transcripts")
+        # participant-level metadata (education, sex, age at entry, diagnoses, ...) of the PITT corpus
+        self.DATA_PITT_METADATA = os.path.join(self.DATA_PITT_ROOT, "PItt-data.xlsx")
+
         # composite cognitive scores
         self.FACTOR_SCORES_THEORY_CSV = os.path.join(self.RESOURCES_DIR, f"factor_scores_theory_2025-01-07-1929.csv")
         self.FACTOR_SCORES_THEORY_2026_COMPATIBLE_WITH_2024 = os.path.join(self.RESOURCES_DIR, f"factor_scores_theory_2026_2026-05-06-1036.csv")  # kw19 data
