@@ -89,6 +89,6 @@ class AudioCutter:
         return self.cut_to_participant_segments(audio_file_path, segmentation, new_path, segments_directory)
 
 
-    def preprocess_dataset(self, dataset: AudioDataset) -> AudioDataset:
+    def preprocess_dataset(self, dataset):
         raise ValueError("Not complete (check original repo), only the cut_to_participant_segments method is used here")
 

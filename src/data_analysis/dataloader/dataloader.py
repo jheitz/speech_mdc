@@ -35,7 +35,7 @@ class LuhaBaseDataLoader:
         self.run_parameters = run_parameters
 
         self.dataset_type = dataset_type
-        assert self.dataset_type in [DatasetType.LUHA2024, DatasetType.LUHA2026, DatasetType.ADReSS, DatasetType.LUHACombined, DatasetType.PITT], f"Invalid dataset type {dataset_type}"
+        assert self.dataset_type in [DatasetType.LUHA2024, DatasetType.LUHA2026, DatasetType.LUHACombined, DatasetType.PITT], f"Invalid dataset type {dataset_type}"
 
         try:
             self.transcript_version = self.config.config_data.transcript_version
@@ -1457,9 +1457,6 @@ class PittDataLoader(LuhaBaseDataLoader):
             dataset = self._multiply_dataset_with_individual_spontaneous_speech_tasks(
                 dataset, transcripts, audio_files_df, tasks=self.TASKS,
                 extra_task_variables={'snr_db': snr_df})
-
-        if self.min_n_letters is not None:
-            dataset = self._filter_samples_by_min_n_letters(dataset)
 
         print(f"Loaded {len(dataset)} PITT samples of {per_session['participant'].nunique()} participants "
               f"({per_session['group'].value_counts().to_dict()} sessions)")
