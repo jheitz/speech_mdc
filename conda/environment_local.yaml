@@ -23,6 +23,11 @@ dependencies:
   - torchmetrics
   - ffmpeg=6.1.1
   - ffmpeg-python
+
+  # Notebooks
+  - jupyterlab
+  - notebook
+
   - pip
   - pip:
     # Hugging Face ecosystem
@@ -31,6 +36,13 @@ dependencies:
     - peft==0.11.1
     - accelerate==0.33.0
     - sentencepiece
+
+    # Gradient Boosting
+    - xgboost
+
+    # Statistics
+    - pingouin
+    - semopy
 
     # Model Interpretability
     - shap
@@ -47,6 +59,7 @@ dependencies:
     # Natural Language Processing
     - nltk
     - stanza==1.5
+    - jiwer
 
     # Visualization
     - matplotlib

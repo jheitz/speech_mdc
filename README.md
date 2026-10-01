@@ -2,9 +2,8 @@
 
 This repository contains code and data for the paper submission "Spontaneous Speech as a Scalable Digital Biomarker for Monitoring Cognitive Change in Older Adults".
 
-
 ## Repository structure
-- `conda/`: `environment.yaml` and `environment_clean.yaml` file for conda environment setup
+- `conda/`: `environment_server.yaml` and `environment_local.yaml`: Specifying python and library versions for the server (for the data_analysis pipeline, which was run on a Linux server), and for a local setup (for the jupyter notebooks in `notebooks`, which were run on a MacBook computer)
 - `src`: Code used for raw study data preparation and cross-sectional supervised regression.
 - `src/data_preparation`: Code used in the preparation of the raw data from Prolific / ACS / study web server (e.g. automatic transcription of audio files, data quality checks)
 - `src/data_analysis`: Data analysis pipeline code for data loading, feature extraction, regression models
